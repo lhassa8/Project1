@@ -94,6 +94,13 @@ class AgentConfig:
         except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"Failed to parse config file {path}: {exc}") from exc
 
+        # Validate against schema before parsing
+        from agent_runner.config_schema import ConfigError, validate_config
+
+        errors = validate_config(data)
+        if errors:
+            raise ConfigError(errors)
+
         return cls._from_dict(data)
 
     @classmethod

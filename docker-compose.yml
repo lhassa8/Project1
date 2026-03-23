@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  agent-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: agent-runner
+    ports:
+      - "8811:8811"
+    volumes:
+      # Mount source for live-reload during development
+      - .:/app:cached
+      # Persist audit logs and run data outside the container
+      - agent-data:/app/.agent_runs
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AGENT_RUNNER_HOST=0.0.0.0
+      - AGENT_RUNNER_PORT=8811
+      - AGENT_RUNNER_LOG_LEVEL=${AGENT_RUNNER_LOG_LEVEL:-INFO}
+      - AGENT_RUNNER_GRACE_PERIOD=${AGENT_RUNNER_GRACE_PERIOD:-30}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8811/health/live')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    # Ensure Python gets SIGTERM for graceful shutdown
+    stop_grace_period: 35s
+
+volumes:
+  agent-data:

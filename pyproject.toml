@@ -1,7 +1,7 @@
 [project]
 name = "agent-runner"
-version = "0.2.0"
-description = "Native Claude tool-call loop with interception, shadow mode, approval gates, and MCP bridging"
+version = "1.0.0"
+description = "Enterprise-grade Claude tool-call loop with shadow mode, approval workflows, RBAC, MCP bridging, circuit breakers, and full observability"
 requires-python = ">=3.10"
 license = "MIT"
 keywords = [
@@ -13,15 +13,19 @@ keywords = [
     "shadow-mode",
     "approval",
     "interceptor",
+    "enterprise",
+    "rbac",
+    "audit",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "anthropic>=0.39.0",
@@ -30,6 +34,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+]
+yaml = [
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
