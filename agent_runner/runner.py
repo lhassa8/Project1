@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 import anthropic
 
+from agent_runner.events import EventStream, make_event as _make_event
 from agent_runner.hooks import HookManager
 from agent_runner.interceptors.base import InterceptAction, Interceptor
 from agent_runner.sandbox import ResourceLimits, SandboxViolation
@@ -54,6 +57,94 @@ class TokenUsage:
         }
         in_rate, out_rate = rates.get(model, (3.0, 15.0))
         return (self.input_tokens * in_rate + self.output_tokens * out_rate) / 1_000_000
+
+
+class ContextManager:
+    """Manage conversation history within token budgets."""
+
+    def __init__(
+        self,
+        max_context_tokens: int = 100_000,
+        strategy: str = "sliding_window",  # "sliding_window" or "keep_ends"
+        reserve_tokens: int = 4096,        # reserve for response
+    ):
+        self.max_context_tokens = max_context_tokens
+        self.strategy = strategy
+        self.reserve_tokens = reserve_tokens
+
+    def _estimate_tokens(self, message: dict) -> int:
+        """Estimate tokens for a single message (~4 chars per token)."""
+        content = message.get("content", "")
+        if isinstance(content, str):
+            char_count = len(content)
+        elif isinstance(content, list):
+            char_count = len(json.dumps(content))
+        else:
+            char_count = len(str(content))
+        return max(char_count // 4, 1)
+
+    def _total_tokens(self, messages: list[dict]) -> int:
+        """Estimate total tokens for a list of messages."""
+        return sum(self._estimate_tokens(m) for m in messages)
+
+    def trim(self, messages: list[dict]) -> list[dict]:
+        """Trim messages to fit within the token budget.
+
+        Strategies:
+        - sliding_window: keep last N messages that fit
+        - keep_ends: keep first message + last N messages that fit
+
+        Token estimation: ~4 chars per token (rough but fast).
+        """
+        budget = self.max_context_tokens - self.reserve_tokens
+        if budget <= 0:
+            return messages[-1:] if messages else []
+
+        if self._total_tokens(messages) <= budget:
+            return messages
+
+        if self.strategy == "keep_ends":
+            return self._trim_keep_ends(messages, budget)
+        else:
+            return self._trim_sliding_window(messages, budget)
+
+    def _trim_sliding_window(self, messages: list[dict], budget: int) -> list[dict]:
+        """Keep last N messages that fit within budget."""
+        result: list[dict] = []
+        running = 0
+        for msg in reversed(messages):
+            cost = self._estimate_tokens(msg)
+            if running + cost > budget:
+                break
+            result.append(msg)
+            running += cost
+        result.reverse()
+        return result
+
+    def _trim_keep_ends(self, messages: list[dict], budget: int) -> list[dict]:
+        """Keep first message + last N messages that fit."""
+        if not messages:
+            return []
+        if len(messages) <= 2:
+            return list(messages)
+
+        first = messages[0]
+        first_cost = self._estimate_tokens(first)
+        remaining_budget = budget - first_cost
+        if remaining_budget <= 0:
+            return [first]
+
+        # Fill from the end
+        tail: list[dict] = []
+        running = 0
+        for msg in reversed(messages[1:]):
+            cost = self._estimate_tokens(msg)
+            if running + cost > remaining_budget:
+                break
+            tail.append(msg)
+            running += cost
+        tail.reverse()
+        return [first] + tail
 
 
 @dataclass
@@ -104,6 +195,31 @@ class Conversation:
         self.results.clear()
         self.total_usage = TokenUsage()
 
+    def save(self, path: str) -> None:
+        """Save conversation state to a JSON file."""
+        data = {
+            "messages": self._messages,
+            "total_usage": {
+                "input_tokens": self.total_usage.input_tokens,
+                "output_tokens": self.total_usage.output_tokens,
+            },
+            "metadata": {
+                "model": self._runner.model,
+                "timestamp": time.time(),
+            },
+        }
+        Path(path).write_text(json.dumps(data, indent=2, default=str))
+
+    def load(self, path: str) -> None:
+        """Load conversation state from a JSON file."""
+        data = json.loads(Path(path).read_text())
+        self._messages = data["messages"]
+        usage = data.get("total_usage", {})
+        self.total_usage = TokenUsage(
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+
 
 class AgentRunner:
     """Execute a multi-turn Claude conversation with native tool-call handling.
@@ -135,6 +251,10 @@ class AgentRunner:
         Initial delay in seconds between retries (doubles each attempt).
     resource_limits : ResourceLimits | None
         Resource limits (max tool calls, output size, cost budget, timeouts).
+    context_manager : ContextManager | None
+        Optional context window manager to trim messages before API calls.
+    event_stream : EventStream | None
+        Optional event stream for structured observability.
     """
 
     def __init__(
@@ -151,6 +271,8 @@ class AgentRunner:
         retries: int = 2,
         retry_delay: float = 1.0,
         resource_limits: ResourceLimits | None = None,
+        context_manager: ContextManager | None = None,
+        event_stream: EventStream | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.tools = tools
@@ -163,6 +285,8 @@ class AgentRunner:
         self.retries = retries
         self.retry_delay = retry_delay
         self.resource_limits = resource_limits or ResourceLimits()
+        self.context_manager = context_manager
+        self.event_stream = event_stream
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     # ------------------------------------------------------------------
@@ -188,26 +312,51 @@ class AgentRunner:
         result = RunResult()
         result.messages = messages
 
+        run_id = uuid.uuid4().hex[:12]
+
         self.hooks.emit("run_start", user_message)
+        if self.event_stream:
+            self.event_stream.record(_make_event(
+                "run_start", run_id, 0, {"prompt": user_message}
+            ))
 
         t0 = time.monotonic()
         for turn in range(self.max_turns):
             self.hooks.emit("turn_start", turn + 1, messages)
+            if self.event_stream:
+                self.event_stream.record(_make_event(
+                    "turn_start", run_id, turn + 1, {}
+                ))
+
+            # Apply context window trimming before API call
+            api_messages = messages
+            if self.context_manager:
+                api_messages = self.context_manager.trim(messages)
 
             if self.on_text:
-                response = self._call_api_streaming(messages)
+                response = self._call_api_streaming(api_messages)
             else:
-                response = self._call_api(messages)
+                response = self._call_api(api_messages)
 
             assistant_content = response.content
             stop_reason = response.stop_reason
 
             # Track token usage
+            input_toks = 0
+            output_toks = 0
             if hasattr(response, "usage") and response.usage:
+                input_toks = getattr(response.usage, "input_tokens", 0)
+                output_toks = getattr(response.usage, "output_tokens", 0)
                 result.usage.add(
-                    input_tokens=getattr(response.usage, "input_tokens", 0),
-                    output_tokens=getattr(response.usage, "output_tokens", 0),
+                    input_tokens=input_toks,
+                    output_tokens=output_toks,
                 )
+
+            if self.event_stream:
+                self.event_stream.record(_make_event(
+                    "api_request", run_id, turn + 1,
+                    {"input_tokens": input_toks, "output_tokens": output_toks},
+                ))
 
             # Append the full assistant turn
             messages.append({"role": "assistant", "content": assistant_content})
@@ -222,7 +371,9 @@ class AgentRunner:
 
             # Process tool calls
             if stop_reason == "tool_use":
-                tool_results = self._process_tool_calls(assistant_content, result)
+                tool_results = self._process_tool_calls(
+                    assistant_content, result, run_id=run_id, turn=turn + 1,
+                )
                 messages.append({"role": "user", "content": tool_results})
         else:
             logger.warning("Agent hit max turns (%d)", self.max_turns)
@@ -231,7 +382,50 @@ class AgentRunner:
 
         result.elapsed_seconds = time.monotonic() - t0
         self.hooks.emit("run_complete", result)
+        if self.event_stream:
+            self.event_stream.record(_make_event(
+                "run_complete", run_id, result.turns_used,
+                {
+                    "total_input_tokens": result.usage.input_tokens,
+                    "total_output_tokens": result.usage.output_tokens,
+                    "elapsed_seconds": result.elapsed_seconds,
+                    "cost_usd": result.usage.estimated_cost(self.model),
+                },
+            ))
         return result
+
+    def estimate_cost(self, prompt: str, expected_turns: int = 3) -> dict:
+        """Estimate cost before running.
+
+        Returns {"min_usd": float, "max_usd": float, "model": str}
+        """
+        # Estimate prompt tokens (~4 chars per token)
+        prompt_tokens = max(len(prompt) // 4, 1)
+        # System prompt tokens
+        system_tokens = max(len(self.system_prompt) // 4, 1)
+        base_input = prompt_tokens + system_tokens
+
+        rates = {
+            "claude-sonnet-4-20250514": (3.0, 15.0),
+            "claude-opus-4-20250514": (15.0, 75.0),
+            "claude-haiku-3-5-20241022": (0.80, 4.0),
+        }
+        in_rate, out_rate = rates.get(self.model, (3.0, 15.0))
+
+        # Min: single turn, short response
+        min_input = base_input
+        min_output = 200  # minimal response
+        min_cost = (min_input * in_rate + min_output * out_rate) / 1_000_000
+
+        # Max: expected_turns turns, each with max_tokens output
+        # Each turn adds previous context to input
+        total_input = 0
+        for t in range(expected_turns):
+            total_input += base_input + t * self.max_tokens
+        total_output = expected_turns * self.max_tokens
+        max_cost = (total_input * in_rate + total_output * out_rate) / 1_000_000
+
+        return {"min_usd": min_cost, "max_usd": max_cost, "model": self.model}
 
     def conversation(self) -> Conversation:
         """Create a new multi-turn conversation context.
@@ -297,7 +491,8 @@ class AgentRunner:
         return self._call_with_retry(_do_stream)
 
     def _process_tool_calls(
-        self, assistant_content: list, result: RunResult
+        self, assistant_content: list, result: RunResult,
+        run_id: str = "", turn: int = 0,
     ) -> list[dict[str, Any]]:
         """Run each tool_use block through the interception pipeline, then execute."""
         tool_results: list[dict[str, Any]] = []
@@ -339,6 +534,8 @@ class AgentRunner:
             action, modified_input = self._intercept(block.name, block.input)
             call_record["action"] = action.value
 
+            tool_t0 = time.monotonic()
+
             if action == InterceptAction.ALLOW:
                 output = self._execute_tool(block.name, modified_input, call_record)
                 output_str = self.resource_limits.truncate_output(str(output))
@@ -361,8 +558,25 @@ class AgentRunner:
                     {"type": "tool_result", "tool_use_id": block.id, "content": str(mock_output)}
                 )
 
+            tool_duration_ms = (time.monotonic() - tool_t0) * 1000
+
             result.tool_call_log.append(call_record)
             self.hooks.emit("tool_call", block.name, block.input, call_record["action"], call_record["output"])
+
+            if self.event_stream:
+                event_data: dict[str, Any] = {
+                    "tool": block.name,
+                    "action": call_record["action"],
+                    "duration_ms": tool_duration_ms,
+                }
+                if call_record["error"]:
+                    self.event_stream.record(_make_event(
+                        "error", run_id, turn, {"tool": block.name, "error": call_record["error"]}
+                    ))
+                    event_data["error"] = call_record["error"]
+                self.event_stream.record(_make_event(
+                    "tool_call", run_id, turn, event_data,
+                ))
 
         return tool_results
 

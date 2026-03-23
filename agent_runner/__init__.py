@@ -57,15 +57,19 @@ Shadow mode with approval::
 """
 
 from agent_runner.config import AgentConfig
+from agent_runner.events import AgentEvent, EventStream
 from agent_runner.hooks import HookManager
 from agent_runner.interceptors.base import InterceptAction, Interceptor
-from agent_runner.runner import AgentRunner, Conversation, RunResult, TokenUsage
+from agent_runner.runner import AgentRunner, ContextManager, Conversation, RunResult, TokenUsage
 from agent_runner.tools.registry import ToolRegistry
 
 __all__ = [
     "AgentConfig",
+    "AgentEvent",
     "AgentRunner",
+    "ContextManager",
     "Conversation",
+    "EventStream",
     "HookManager",
     "InterceptAction",
     "Interceptor",

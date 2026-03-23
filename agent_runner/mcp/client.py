@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,11 +39,23 @@ class MCPClient:
         ``["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]``.
     env : dict[str, str] | None
         Extra environment variables for the server process.
+    timeout : float
+        Timeout in seconds for waiting on server responses (default 30.0).
+    max_retries : int
+        Number of automatic reconnection attempts on server crash (default 2).
     """
 
-    def __init__(self, command: list[str], env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        timeout: float = 30.0,
+        max_retries: int = 2,
+    ) -> None:
         self.command = command
         self.env = env
+        self.timeout = timeout
+        self.max_retries = max_retries
         self._process: subprocess.Popen | None = None
         self._request_id = 0
         self._tools: dict[str, MCPToolSchema] = {}
@@ -52,6 +66,11 @@ class MCPClient:
 
     def start(self) -> None:
         """Launch the MCP server subprocess."""
+        self._launch_process()
+        self._initialize()
+
+    def _launch_process(self) -> None:
+        """Start the underlying subprocess (without MCP handshake)."""
         import os
 
         merged_env = {**os.environ, **(self.env or {})}
@@ -64,15 +83,45 @@ class MCPClient:
             env=merged_env,
         )
         logger.info("Started MCP server: %s (pid=%d)", self.command, self._process.pid)
-        self._initialize()
 
     def stop(self) -> None:
         """Shut down the MCP server subprocess."""
         if self._process:
             self._process.terminate()
-            self._process.wait(timeout=5)
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=2)
             logger.info("Stopped MCP server (pid=%d)", self._process.pid)
             self._process = None
+
+    def _restart(self) -> None:
+        """Terminate the old process and start a new one."""
+        logger.warning("Restarting MCP server process")
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=3)
+            except Exception:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=2)
+                except Exception:
+                    pass
+            self._process = None
+        self._request_id = 0
+        self._launch_process()
+        self._initialize()
+
+    def health_check(self) -> bool:
+        """Verify the server is alive by checking the process status.
+
+        Returns True if the server process is running, False otherwise.
+        """
+        if not self._process:
+            return False
+        return self._process.poll() is None
 
     def __enter__(self) -> MCPClient:
         self.start()
@@ -84,6 +133,29 @@ class MCPClient:
     # ------------------------------------------------------------------
     # JSON-RPC over stdio
     # ------------------------------------------------------------------
+
+    def _read_with_timeout(self, timeout: float) -> str:
+        """Read a line from stdout with timeout."""
+        q: queue.Queue[str | Exception] = queue.Queue()
+
+        def reader() -> None:
+            try:
+                line = self._process.stdout.readline()  # type: ignore[union-attr]
+                q.put(line)
+            except Exception as e:
+                q.put(e)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+        try:
+            result = q.get(timeout=timeout)
+            if isinstance(result, Exception):
+                raise result
+            return result  # type: ignore[return-value]
+        except queue.Empty:
+            raise TimeoutError(
+                f"MCP server did not respond within {timeout}s"
+            )
 
     def _send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Send a JSON-RPC request and read the response."""
@@ -103,7 +175,7 @@ class MCPClient:
         self._process.stdin.write(line)
         self._process.stdin.flush()
 
-        response_line = self._process.stdout.readline()
+        response_line = self._read_with_timeout(self.timeout)
         if not response_line:
             raise RuntimeError("MCP server closed stdout unexpectedly")
 
@@ -143,9 +215,34 @@ class MCPClient:
         return tools
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        """Invoke a tool on the MCP server."""
-        result = self._send("tools/call", {"name": name, "arguments": arguments})
-        # MCP returns content as a list of content blocks
-        content = result.get("content", [])
-        texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-        return "\n".join(texts) if texts else json.dumps(result)
+        """Invoke a tool on the MCP server.
+
+        If the server crashes mid-call, automatically reconnects and retries
+        up to ``max_retries`` times.
+        """
+        last_error: Exception | None = None
+        for attempt in range(1 + self.max_retries):
+            try:
+                result = self._send("tools/call", {"name": name, "arguments": arguments})
+                # MCP returns content as a list of content blocks
+                content = result.get("content", [])
+                texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                return "\n".join(texts) if texts else json.dumps(result)
+            except (RuntimeError, TimeoutError, OSError, BrokenPipeError) as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    logger.warning(
+                        "MCP call_tool failed (attempt %d/%d): %s — reconnecting",
+                        attempt + 1,
+                        1 + self.max_retries,
+                        exc,
+                    )
+                    try:
+                        self._restart()
+                    except Exception as restart_exc:
+                        logger.error("Failed to restart MCP server: %s", restart_exc)
+                        raise last_error from restart_exc
+                else:
+                    raise
+        # Should not reach here, but just in case
+        raise last_error  # type: ignore[misc]

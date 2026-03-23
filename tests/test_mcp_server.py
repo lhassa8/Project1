@@ -62,6 +62,26 @@ class TestMCPServer:
         assert "error" in resp
         assert resp["error"]["code"] == -32601
 
+    def test_tools_call_malformed_arguments(self):
+        """Malformed (non-dict) tool arguments should return INVALID_PARAMS error."""
+        resp = self._request("tools/call", {"name": "echo", "arguments": "not a dict"})
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+        assert "must be an object" in resp["error"]["message"]
+
+    def test_tools_call_missing_arguments(self):
+        """Missing arguments key should default to empty dict, not crash."""
+        resp = self._request("tools/call", {"name": "echo"})
+        # The handler will fail because 'text' is missing, but it should
+        # be a tool error, not a server crash
+        assert resp["result"]["isError"] is True
+
+    def test_graceful_shutdown_flag(self):
+        """Server has a _running flag for graceful shutdown."""
+        assert self.server._running is True
+        self.server._running = False
+        assert self.server._running is False
+
 
 class TestBuildRegistry:
     def test_default_builds_all_builtins(self):

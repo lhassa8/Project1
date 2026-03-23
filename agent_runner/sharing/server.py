@@ -20,13 +20,65 @@ from agent_runner.sharing.run_store import RunStore, RunStatus
 logger = logging.getLogger(__name__)
 
 
-def create_approval_app(store: RunStore, host: str = "0.0.0.0", port: int = 8811) -> HTTPServer:
-    """Create and return an HTTPServer (call ``.serve_forever()`` to start)."""
+def create_approval_app(
+    store: RunStore,
+    host: str = "0.0.0.0",
+    port: int = 8811,
+    auth_token: str | None = None,
+) -> HTTPServer:
+    """Create and return an HTTPServer (call ``.serve_forever()`` to start).
+
+    Parameters
+    ----------
+    store : RunStore
+        The backing store for run records.
+    host : str
+        Bind address.
+    port : int
+        Bind port.
+    auth_token : str | None
+        If set, all API endpoints require ``Authorization: Bearer <token>``.
+        The HTML review page embeds the token in a hidden form field so
+        browser-based approval still works.
+    """
 
     class Handler(BaseHTTPRequestHandler):
+        def _check_auth(self) -> bool:
+            """Return True if the request is authorised.
+
+            When *auth_token* is ``None`` every request is allowed.
+            Otherwise the caller must supply
+            ``Authorization: Bearer <token>``.
+            """
+            if auth_token is None:
+                return True
+            header = self.headers.get("Authorization", "")
+            if header == f"Bearer {auth_token}":
+                return True
+            self._respond_json(
+                {"error": "Unauthorized – supply 'Authorization: Bearer <token>' header"},
+                401,
+            )
+            return False
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/")
+
+            # The HTML review page is served without requiring the header
+            # so that a browser can open it.  The token is embedded in a
+            # hidden field for subsequent POST actions.
+            if path.startswith("/review/"):
+                run_id = path.split("/")[2]
+                record = store.get(run_id)
+                if record:
+                    self._respond_html(self._render_review_page(record))
+                else:
+                    self._respond_html("<h1>Run not found</h1>", 404)
+                return
+
+            if not self._check_auth():
+                return
 
             if path == "" or path == "/runs":
                 self._respond_json([r.to_dict() for r in store.list_pending()])
@@ -39,18 +91,13 @@ def create_approval_app(store: RunStore, host: str = "0.0.0.0", port: int = 8811
                 else:
                     self._respond_json({"error": "not found"}, 404)
 
-            elif path.startswith("/review/"):
-                run_id = path.split("/")[2]
-                record = store.get(run_id)
-                if record:
-                    self._respond_html(self._render_review_page(record))
-                else:
-                    self._respond_html("<h1>Run not found</h1>", 404)
-
             else:
                 self._respond_json({"error": "not found"}, 404)
 
         def do_POST(self) -> None:
+            if not self._check_auth():
+                return
+
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/")
 
@@ -115,6 +162,13 @@ def create_approval_app(store: RunStore, host: str = "0.0.0.0", port: int = 8811
                 "rejected": "#f44747",
             }.get(record.status.value, "#ccc")
 
+            # Embed the auth token (if any) so the browser JS can include
+            # it in POST requests.
+            token_value = auth_token or ""
+            token_header_js = ""
+            if auth_token:
+                token_header_js = f"'Authorization': 'Bearer {auth_token}',"
+
             return f"""<!DOCTYPE html>
 <html><head><title>Review Run {record.id}</title>
 <style>
@@ -128,6 +182,7 @@ def create_approval_app(store: RunStore, host: str = "0.0.0.0", port: int = 8811
 </style></head>
 <body>
   <h1>Run {record.id}</h1>
+  <input type="hidden" id="auth_token" value="{token_value}">
   <p>Status: <strong style="color:{status_color}">{record.status.value.upper()}</strong></p>
 
   <div class="card">
@@ -160,7 +215,10 @@ def create_approval_app(store: RunStore, host: str = "0.0.0.0", port: int = 8811
       const reviewer = prompt('Your name (optional):', '') || 'anonymous';
       const res = await fetch('/runs/{record.id}/' + action, {{
         method: 'POST',
-        headers: {{'Content-Type': 'application/json'}},
+        headers: {{
+          'Content-Type': 'application/json',
+          {token_header_js}
+        }},
         body: JSON.stringify({{reviewer}})
       }});
       const data = await res.json();

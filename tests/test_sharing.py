@@ -149,3 +149,115 @@ class TestApprovalServer:
             assert data["status"] == "rejected"
         finally:
             server.shutdown()
+
+
+class TestApprovalServerAuth:
+    """Token-based authentication for the approval server."""
+
+    def _start_server(self, store, auth_token=None):
+        server = create_approval_app(store, host="127.0.0.1", port=0, auth_token=auth_token)
+        port = server.server_address[1]
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, port
+
+    def test_no_auth_required_when_token_none(self, tmp_path):
+        store = RunStore(store_dir=tmp_path / "runs")
+        store.save("p", "r", [], [])
+        server, port = self._start_server(store, auth_token=None)
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", "/runs")
+            resp = conn.getresponse()
+            assert resp.status == 200
+        finally:
+            server.shutdown()
+
+    def test_request_without_token_returns_401(self, tmp_path):
+        store = RunStore(store_dir=tmp_path / "runs")
+        store.save("p", "r", [], [])
+        server, port = self._start_server(store, auth_token="s3cret")
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", "/runs")
+            resp = conn.getresponse()
+            assert resp.status == 401
+            data = json.loads(resp.read())
+            assert "Unauthorized" in data["error"]
+        finally:
+            server.shutdown()
+
+    def test_request_with_wrong_token_returns_401(self, tmp_path):
+        store = RunStore(store_dir=tmp_path / "runs")
+        store.save("p", "r", [], [])
+        server, port = self._start_server(store, auth_token="s3cret")
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", "/runs", headers={"Authorization": "Bearer wrong"})
+            resp = conn.getresponse()
+            assert resp.status == 401
+        finally:
+            server.shutdown()
+
+    def test_request_with_correct_token_succeeds(self, tmp_path):
+        store = RunStore(store_dir=tmp_path / "runs")
+        record = store.save("p", "r", [], [])
+        server, port = self._start_server(store, auth_token="s3cret")
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", "/runs", headers={"Authorization": "Bearer s3cret"})
+            resp = conn.getresponse()
+            assert resp.status == 200
+            data = json.loads(resp.read())
+            assert len(data) == 1
+        finally:
+            server.shutdown()
+
+    def test_post_without_token_returns_401(self, tmp_path):
+        store = RunStore(store_dir=tmp_path / "runs")
+        record = store.save("p", "r", [], [])
+        server, port = self._start_server(store, auth_token="s3cret")
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            body = json.dumps({"reviewer": "tester"}).encode()
+            conn.request("POST", f"/runs/{record.id}/approve", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            assert resp.status == 401
+        finally:
+            server.shutdown()
+
+    def test_post_with_correct_token_succeeds(self, tmp_path):
+        store = RunStore(store_dir=tmp_path / "runs")
+        record = store.save("p", "r", [], [])
+        server, port = self._start_server(store, auth_token="s3cret")
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            body = json.dumps({"reviewer": "tester"}).encode()
+            conn.request("POST", f"/runs/{record.id}/approve", body=body,
+                         headers={
+                             "Content-Type": "application/json",
+                             "Authorization": "Bearer s3cret",
+                         })
+            resp = conn.getresponse()
+            assert resp.status == 200
+            data = json.loads(resp.read())
+            assert data["status"] == "approved"
+        finally:
+            server.shutdown()
+
+    def test_review_page_accessible_without_token(self, tmp_path):
+        """The HTML review page should be accessible without the auth header."""
+        store = RunStore(store_dir=tmp_path / "runs")
+        record = store.save("p", "r", [], [{"tool": "w", "input": {}}])
+        server, port = self._start_server(store, auth_token="s3cret")
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", f"/review/{record.id}")
+            resp = conn.getresponse()
+            assert resp.status == 200
+            html = resp.read().decode()
+            assert "auth_token" in html
+            assert "s3cret" in html  # token embedded in hidden field
+        finally:
+            server.shutdown()
