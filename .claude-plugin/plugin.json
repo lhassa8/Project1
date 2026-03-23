@@ -1,0 +1,29 @@
+{
+  "name": "agent-runner",
+  "description": "Native Claude tool-call loop with interception, shadow mode, and MCP bridging. Run agents with full control over tool approval, mutation capture, and replay.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Agent Runner Contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "tools",
+    "mcp",
+    "shadow-mode",
+    "approval",
+    "interceptor",
+    "tool-call-loop"
+  ],
+  "category": "development",
+  "commands": ["./commands/"],
+  "agents": ["./agents/"],
+  "skills": ["./skills/"],
+  "mcpServers": {
+    "agent-runner": {
+      "command": "python",
+      "args": ["-m", "agent_runner.mcp_server"],
+      "env": {}
+    }
+  }
+}
