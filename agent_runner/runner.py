@@ -19,6 +19,7 @@ import anthropic
 
 from agent_runner.hooks import HookManager
 from agent_runner.interceptors.base import InterceptAction, Interceptor
+from agent_runner.sandbox import ResourceLimits, SandboxViolation
 from agent_runner.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,8 @@ class AgentRunner:
         Number of retries on transient API errors (rate limits, timeouts).
     retry_delay : float
         Initial delay in seconds between retries (doubles each attempt).
+    resource_limits : ResourceLimits | None
+        Resource limits (max tool calls, output size, cost budget, timeouts).
     """
 
     def __init__(
@@ -147,6 +150,7 @@ class AgentRunner:
         hooks: HookManager | None = None,
         retries: int = 2,
         retry_delay: float = 1.0,
+        resource_limits: ResourceLimits | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.tools = tools
@@ -158,6 +162,7 @@ class AgentRunner:
         self.hooks = hooks or HookManager()
         self.retries = retries
         self.retry_delay = retry_delay
+        self.resource_limits = resource_limits or ResourceLimits()
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     # ------------------------------------------------------------------
@@ -301,6 +306,26 @@ class AgentRunner:
             if block.type != "tool_use":
                 continue
 
+            # --- Resource limit: tool call count ---
+            try:
+                self.resource_limits.check_tool_count(len(result.tool_call_log) + 1)
+            except SandboxViolation as exc:
+                tool_results.append({
+                    "type": "tool_result", "tool_use_id": block.id,
+                    "content": f"Error: {exc}", "is_error": True,
+                })
+                continue
+
+            # --- Resource limit: cost budget ---
+            try:
+                self.resource_limits.check_cost(result.usage.estimated_cost(self.model))
+            except SandboxViolation as exc:
+                tool_results.append({
+                    "type": "tool_result", "tool_use_id": block.id,
+                    "content": f"Error: {exc}", "is_error": True,
+                })
+                continue
+
             call_record: dict[str, Any] = {
                 "tool": block.name,
                 "input": block.input,
@@ -316,9 +341,10 @@ class AgentRunner:
 
             if action == InterceptAction.ALLOW:
                 output = self._execute_tool(block.name, modified_input, call_record)
-                call_record["output"] = output
+                output_str = self.resource_limits.truncate_output(str(output))
+                call_record["output"] = output_str
                 tool_results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}
+                    {"type": "tool_result", "tool_use_id": block.id, "content": output_str}
                 )
 
             elif action == InterceptAction.DENY:

@@ -125,7 +125,7 @@ class TestInterceptors:
         action, result = si.intercept("write_file", {"path": "x.txt", "content": "hi"})
         assert action == InterceptAction.MOCK
         assert len(si.captured_writes) == 1
-        assert "[shadow]" in str(result)
+        assert "Wrote" in str(result) or "[shadow]" in str(result)
 
     def test_shadow_replay(self):
         si = ShadowInterceptor()

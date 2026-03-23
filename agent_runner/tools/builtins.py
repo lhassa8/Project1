@@ -1,7 +1,8 @@
 """Built-in tools that ship with the runner.
 
-These are simple, safe tools useful for demos and testing.
-Production deployments will register their own domain-specific tools.
+These tools support optional sandboxing for production use.
+Without a sandbox, they behave as before (no restrictions).
+With a sandbox, file paths are validated and shell commands are policy-checked.
 """
 
 from __future__ import annotations
@@ -15,8 +16,20 @@ from typing import Any
 from agent_runner.tools.registry import ToolRegistry
 
 
-def register_builtins(registry: ToolRegistry) -> None:
-    """Add the default tool set to *registry*."""
+def register_builtins(
+    registry: ToolRegistry,
+    path_sandbox: Any | None = None,
+    shell_policy: Any | None = None,
+) -> None:
+    """Add the default tool set to *registry*.
+
+    Parameters
+    ----------
+    path_sandbox : PathSandbox | None
+        If provided, file tools validate paths against the sandbox.
+    shell_policy : ShellPolicy | None
+        If provided, shell commands are checked against the policy.
+    """
 
     @registry.tool(
         name="calculator",
@@ -47,7 +60,7 @@ def register_builtins(registry: ToolRegistry) -> None:
 
     @registry.tool(
         name="shell",
-        description="Execute a shell command and return its stdout and stderr. Use with caution.",
+        description="Execute a shell command and return its stdout and stderr.",
         input_schema={
             "type": "object",
             "properties": {
@@ -63,22 +76,39 @@ def register_builtins(registry: ToolRegistry) -> None:
     )
     def shell(params: dict[str, Any]) -> str:
         cmd = params["command"]
+
+        # Shell policy check
+        if shell_policy is not None:
+            try:
+                shell_policy.check(cmd)
+            except Exception as exc:
+                return f"Error: {exc}"
+
+        timeout = shell_policy.max_runtime if shell_policy else 30
+        max_output = shell_policy.max_output_bytes if shell_policy else 1_000_000
+
         try:
             proc = subprocess.run(
                 cmd,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=timeout,
             )
             output = ""
             if proc.stdout:
                 output += proc.stdout
             if proc.stderr:
                 output += f"\n[stderr]\n{proc.stderr}"
-            return output.strip() or "(no output)"
+            output = output.strip() or "(no output)"
+
+            # Truncate if over limit
+            if len(output.encode("utf-8", errors="replace")) > max_output:
+                output = output[:max_output] + "\n... (output truncated)"
+
+            return output
         except subprocess.TimeoutExpired:
-            return "Error: command timed out after 30 seconds"
+            return f"Error: command timed out after {timeout} seconds"
         except Exception as exc:
             return f"Error: {exc}"
 
@@ -98,8 +128,14 @@ def register_builtins(registry: ToolRegistry) -> None:
         category="file",
     )
     def read_file(params: dict[str, Any]) -> str:
+        path = params["path"]
+        if path_sandbox is not None:
+            try:
+                path = path_sandbox.validate(path)
+            except Exception as exc:
+                return f"Error: {exc}"
         try:
-            with open(params["path"]) as f:
+            with open(path) as f:
                 return f.read()
         except Exception as exc:
             return f"Error: {exc}"
@@ -127,6 +163,11 @@ def register_builtins(registry: ToolRegistry) -> None:
     def list_files(params: dict[str, Any]) -> str:
         path = params.get("path", ".")
         recursive = params.get("recursive", False)
+        if path_sandbox is not None:
+            try:
+                path = path_sandbox.validate(path)
+            except Exception as exc:
+                return f"Error: {exc}"
         try:
             if recursive:
                 entries = []
@@ -170,8 +211,14 @@ def register_builtins(registry: ToolRegistry) -> None:
         is_write=True,
     )
     def write_file(params: dict[str, Any]) -> str:
+        path = params["path"]
+        if path_sandbox is not None:
+            try:
+                path = path_sandbox.validate(path)
+            except Exception as exc:
+                return f"Error: {exc}"
         try:
-            with open(params["path"], "w") as f:
+            with open(path, "w") as f:
                 f.write(params["content"])
             return f"Wrote {len(params['content'])} bytes to {params['path']}"
         except Exception as exc:
