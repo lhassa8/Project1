@@ -20,6 +20,12 @@ Usage::
 
     # Start the approval review server
     python main.py --serve-approvals
+
+    # Replay an approved run's captured writes
+    python main.py --replay abc123def456
+
+    # Interactive multi-turn conversation
+    python main.py
 """
 
 from __future__ import annotations
@@ -75,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start the approval review web server",
     )
+    p.add_argument(
+        "--replay",
+        type=str,
+        default=None,
+        help="Replay captured writes from an approved run ID",
+    )
     p.add_argument("--port", type=int, default=8811, help="Port for approval server")
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     return p
@@ -87,6 +99,38 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    # --- Replay approved runs ---
+    if args.replay:
+        from agent_runner.sharing.run_store import RunStore, RunStatus
+
+        store = RunStore()
+        record = store.get(args.replay)
+        if record is None:
+            print(f"Error: run '{args.replay}' not found.")
+            sys.exit(1)
+        if record.status not in (RunStatus.APPROVED, RunStatus.REPLAYED):
+            print(f"Error: run '{args.replay}' has status '{record.status.value}' (must be approved).")
+            sys.exit(1)
+
+        registry = ToolRegistry()
+        register_builtins(registry)
+
+        print(f"Replaying run {record.id} ({len(record.captured_writes)} captured writes)...")
+        for i, cap in enumerate(record.captured_writes):
+            handler = registry.get(cap["tool"])
+            if handler is None:
+                print(f"  [{i+1}] {cap['tool']}: SKIPPED (unknown tool)")
+                continue
+            try:
+                output = handler(cap["input"])
+                print(f"  [{i+1}] {cap['tool']}: {str(output)[:200]}")
+            except Exception as exc:
+                print(f"  [{i+1}] {cap['tool']}: ERROR — {exc}")
+
+        store.mark_replayed(record.id)
+        print(f"\nDone. Run {record.id} marked as replayed.")
+        return
 
     # --- Serve approval UI ---
     if args.serve_approvals:
@@ -171,60 +215,64 @@ def main() -> None:
     runner = AgentRunner(**runner_kwargs)
 
     # --- Execute ---
-    if args.prompt:
-        prompts = [args.prompt]
-    else:
-        print("Interactive mode. Type your prompt (Ctrl-D to exit).")
-        prompts = []
-        try:
-            while True:
-                line = input("\n> ")
-                if line.strip():
-                    prompts.append(line.strip())
-        except (EOFError, KeyboardInterrupt):
-            pass
+    def _handle_result(prompt: str, result: Any) -> None:
+        """Display a run result and handle shadow captures."""
+        print(f"\n--- Response ({result.turns_used} turns) ---")
+        print(result.final_text)
+
+        if result.tool_call_log:
+            print(f"\n--- Tool Calls ({len(result.tool_call_log)}) ---")
+            for call in result.tool_call_log:
+                print(f"  {call['tool']}  [{call['action']}]")
+
+        if shadow_interceptor and shadow_interceptor.captured_writes:
+            print(f"\n--- Shadow Captures ({len(shadow_interceptor.captured_writes)}) ---")
+            for cap in shadow_interceptor.captured_writes:
+                print(f"  {cap['tool']}: {json.dumps(cap['input'], default=str)[:120]}")
+
+            if args.share:
+                from agent_runner.sharing.run_store import RunStore
+
+                store = RunStore()
+                record = store.save(
+                    prompt=prompt,
+                    final_text=result.final_text,
+                    tool_call_log=result.tool_call_log,
+                    captured_writes=shadow_interceptor.captured_writes,
+                )
+                print(f"\n  Share this link for approval:")
+                print(f"  http://localhost:{args.port}/review/{record.id}")
+                print(f"  (Start server with: python main.py --serve-approvals)")
+            else:
+                answer = input("\nReplay captured writes? [y/N] ").strip().lower()
+                if answer in ("y", "yes"):
+                    results = shadow_interceptor.replay(registry)
+                    for r in results:
+                        print(f"  Replayed {r['tool']}: {r['output']}")
 
     try:
-        for prompt in prompts:
+        if args.prompt:
+            # One-shot mode
             print(f"\n{'='*60}")
-            print(f"Prompt: {prompt}")
+            print(f"Prompt: {args.prompt}")
             print("=" * 60)
-
-            result = runner.run(prompt)
-
-            print(f"\n--- Response ({result.turns_used} turns) ---")
-            print(result.final_text)
-
-            if result.tool_call_log:
-                print(f"\n--- Tool Calls ({len(result.tool_call_log)}) ---")
-                for call in result.tool_call_log:
-                    print(f"  {call['tool']}  [{call['action']}]")
-
-            if shadow_interceptor and shadow_interceptor.captured_writes:
-                print(f"\n--- Shadow Captures ({len(shadow_interceptor.captured_writes)}) ---")
-                for cap in shadow_interceptor.captured_writes:
-                    print(f"  {cap['tool']}: {json.dumps(cap['input'], default=str)[:120]}")
-
-                # --- Shareable run link ---
-                if args.share:
-                    from agent_runner.sharing.run_store import RunStore
-
-                    store = RunStore()
-                    record = store.save(
-                        prompt=prompt,
-                        final_text=result.final_text,
-                        tool_call_log=result.tool_call_log,
-                        captured_writes=shadow_interceptor.captured_writes,
-                    )
-                    print(f"\n  Share this link for approval:")
-                    print(f"  http://localhost:{args.port}/review/{record.id}")
-                    print(f"  (Start server with: python main.py --serve-approvals)")
-                else:
-                    answer = input("\nReplay captured writes? [y/N] ").strip().lower()
-                    if answer in ("y", "yes"):
-                        results = shadow_interceptor.replay(registry)
-                        for r in results:
-                            print(f"  Replayed {r['tool']}: {r['output']}")
+            result = runner.run(args.prompt)
+            _handle_result(args.prompt, result)
+        else:
+            # Multi-turn interactive mode — conversation history persists
+            print("Interactive mode (multi-turn). Type your prompt (Ctrl-D to exit).")
+            conversation: list[dict[str, Any]] = []
+            try:
+                while True:
+                    line = input("\n> ").strip()
+                    if not line:
+                        continue
+                    print(f"\n{'='*60}")
+                    result = runner.run(line, conversation=conversation)
+                    conversation = result.messages  # carry forward full history
+                    _handle_result(line, result)
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
     finally:
         if mcp_client:
             mcp_client.stop()

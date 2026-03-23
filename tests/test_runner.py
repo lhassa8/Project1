@@ -190,3 +190,28 @@ class TestAgentRunner:
         runner.max_turns = 3
         result = runner.run("Loop forever")
         assert result.turns_used == 3
+
+    @patch("agent_runner.runner.anthropic.Anthropic")
+    def test_multi_turn_conversation(self, mock_cls):
+        """Verify that passing conversation history carries context forward."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        mock_client.messages.create.return_value = _api_response(
+            [_text_block("Turn 1 reply")], "end_turn"
+        )
+
+        runner = self._make_runner()
+        r1 = runner.run("Hello")
+        assert r1.final_text == "Turn 1 reply"
+
+        # Second turn carries the conversation forward
+        mock_client.messages.create.return_value = _api_response(
+            [_text_block("Turn 2 reply")], "end_turn"
+        )
+        r2 = runner.run("Follow up", conversation=r1.messages)
+        assert r2.final_text == "Turn 2 reply"
+        # Conversation should have: user1, assistant1, user2, assistant2
+        assert len(r2.messages) == 4
+        assert r2.messages[0]["content"] == "Hello"
+        assert r2.messages[2]["content"] == "Follow up"

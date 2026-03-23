@@ -75,9 +75,22 @@ class AgentRunner:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, user_message: str) -> RunResult:
-        """Run the agent loop to completion for a single user query."""
-        messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+    def run(self, user_message: str, conversation: list[dict[str, Any]] | None = None) -> RunResult:
+        """Run the agent loop to completion for a single user query.
+
+        Parameters
+        ----------
+        user_message : str
+            The new user message to process.
+        conversation : list[dict] | None
+            Optional prior conversation history.  If provided, the new message
+            is appended and the full history is sent to the API.
+        """
+        if conversation is not None:
+            messages = conversation
+            messages.append({"role": "user", "content": user_message})
+        else:
+            messages = [{"role": "user", "content": user_message}]
         result = RunResult()
         result.messages = messages
 
