@@ -209,7 +209,7 @@ def main() -> None:
     shadow_interceptor = None
     if cfg.shadow:
         write_tools = {"write_file", "shell"}
-        read_tools = {"read_file", "calculator"}
+        read_tools = {"read_file", "list_files", "calculator"}
         if mcp_bridge:
             write_tools |= mcp_bridge.get_write_tools()
             read_tools |= mcp_bridge.get_read_tools()

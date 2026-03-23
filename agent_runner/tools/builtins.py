@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 from typing import Any
 
@@ -96,6 +97,50 @@ def register_builtins(registry: ToolRegistry) -> None:
         try:
             with open(params["path"]) as f:
                 return f.read()
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    @registry.tool(
+        name="list_files",
+        description="List files and directories at a given path. Returns names with trailing / for directories.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to list. Defaults to current directory.",
+                    "default": ".",
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "If true, list files recursively (max 200 entries).",
+                    "default": False,
+                },
+            },
+        },
+    )
+    def list_files(params: dict[str, Any]) -> str:
+        path = params.get("path", ".")
+        recursive = params.get("recursive", False)
+        try:
+            if recursive:
+                entries = []
+                for root, dirs, files in os.walk(path):
+                    for d in dirs:
+                        entries.append(os.path.relpath(os.path.join(root, d), path) + "/")
+                    for f in files:
+                        entries.append(os.path.relpath(os.path.join(root, f), path))
+                    if len(entries) >= 200:
+                        entries = entries[:200]
+                        entries.append("... (truncated at 200 entries)")
+                        break
+            else:
+                raw = os.listdir(path)
+                entries = []
+                for name in sorted(raw):
+                    full = os.path.join(path, name)
+                    entries.append(name + "/" if os.path.isdir(full) else name)
+            return "\n".join(entries) if entries else "(empty directory)"
         except Exception as exc:
             return f"Error: {exc}"
 

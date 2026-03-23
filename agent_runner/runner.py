@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 import anthropic
 
+from agent_runner.hooks import HookManager
 from agent_runner.interceptors.base import InterceptAction, Interceptor
 from agent_runner.tools.registry import ToolRegistry
 
@@ -85,6 +86,8 @@ class AgentRunner:
     on_text : Callable[[str], None] | None
         Callback invoked for each text chunk during streaming.
         If provided, the runner uses the streaming API.
+    hooks : HookManager | None
+        Lifecycle event hooks for observing runner events.
     """
 
     def __init__(
@@ -96,6 +99,7 @@ class AgentRunner:
         max_turns: int = DEFAULT_MAX_TURNS,
         api_key: str | None = None,
         on_text: Callable[[str], None] | None = None,
+        hooks: HookManager | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.tools = tools
@@ -103,6 +107,7 @@ class AgentRunner:
         self.model = model
         self.max_turns = max_turns
         self.on_text = on_text
+        self.hooks = hooks or HookManager()
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     # ------------------------------------------------------------------
@@ -128,8 +133,12 @@ class AgentRunner:
         result = RunResult()
         result.messages = messages
 
+        self.hooks.emit("run_start", user_message)
+
         t0 = time.monotonic()
         for turn in range(self.max_turns):
+            self.hooks.emit("turn_start", turn + 1, messages)
+
             if self.on_text:
                 response = self._call_api_streaming(messages)
             else:
@@ -148,6 +157,8 @@ class AgentRunner:
             # Append the full assistant turn
             messages.append({"role": "assistant", "content": assistant_content})
 
+            self.hooks.emit("turn_end", turn + 1, stop_reason)
+
             # If the model stopped naturally, we're done
             if stop_reason == "end_turn":
                 result.final_text = self._extract_text(assistant_content)
@@ -164,6 +175,7 @@ class AgentRunner:
             result.turns_used = self.max_turns
 
         result.elapsed_seconds = time.monotonic() - t0
+        self.hooks.emit("run_complete", result)
         return result
 
     # ------------------------------------------------------------------
@@ -237,6 +249,7 @@ class AgentRunner:
                 )
 
             result.tool_call_log.append(call_record)
+            self.hooks.emit("tool_call", block.name, block.input, call_record["action"], call_record["output"])
 
         return tool_results
 

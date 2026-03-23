@@ -32,7 +32,7 @@ class ShadowInterceptor(Interceptor):
         read_tools: set[str] | None = None,
     ) -> None:
         self.write_tools = write_tools or {"write_file", "shell"}
-        self.read_tools = read_tools or {"read_file", "calculator"}
+        self.read_tools = read_tools or {"read_file", "list_files", "calculator"}
         self.captured_writes: list[dict[str, Any]] = []
 
     def intercept(

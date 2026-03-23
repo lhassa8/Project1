@@ -70,6 +70,34 @@ class TestToolRegistry:
         assert "shell" in names
         assert "read_file" in names
         assert "write_file" in names
+        assert "list_files" in names
+
+    def test_list_files_tool(self, tmp_path):
+        r = ToolRegistry()
+        register_builtins(r)
+        handler = r.get("list_files")
+
+        # Create test files
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "b.txt").write_text("world")
+        (tmp_path / "subdir").mkdir()
+
+        result = handler({"path": str(tmp_path)})
+        assert "a.txt" in result
+        assert "b.txt" in result
+        assert "subdir/" in result
+
+    def test_list_files_recursive(self, tmp_path):
+        r = ToolRegistry()
+        register_builtins(r)
+        handler = r.get("list_files")
+
+        (tmp_path / "dir1").mkdir()
+        (tmp_path / "dir1" / "nested.txt").write_text("x")
+
+        result = handler({"path": str(tmp_path), "recursive": True})
+        assert "dir1/" in result
+        assert "nested.txt" in result
 
 
 # ---- Interceptor tests ----
