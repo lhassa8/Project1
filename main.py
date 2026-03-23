@@ -6,6 +6,9 @@ Usage::
     # Basic one-shot
     python main.py "What is 2^10?"
 
+    # Streaming mode (tokens printed as they arrive)
+    python main.py --stream "Explain quicksort"
+
     # Shadow mode (captures writes, doesn't execute them)
     python main.py --shadow "Create a file called hello.txt with a greeting"
 
@@ -24,6 +27,9 @@ Usage::
     # Replay an approved run's captured writes
     python main.py --replay abc123def456
 
+    # Use a config file instead of CLI flags
+    python main.py --config agent.json "Do something"
+
     # Interactive multi-turn conversation
     python main.py
 """
@@ -34,6 +40,7 @@ import argparse
 import json
 import logging
 import sys
+from typing import Any
 
 from agent_runner.runner import AgentRunner
 from agent_runner.tools.registry import ToolRegistry
@@ -57,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--share",
         action="store_true",
         help="Save shadow run for async stakeholder approval (requires --shadow)",
+    )
+    p.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream tokens to stdout as they arrive",
     )
     p.add_argument(
         "--approve",
@@ -87,6 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Replay captured writes from an approved run ID",
     )
+    p.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to config file (JSON or YAML). Auto-discovers agent.json/agent.yaml if present.",
+    )
     p.add_argument("--port", type=int, default=8811, help="Port for approval server")
     p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     return p
@@ -99,6 +117,15 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    # --- Load config (file + CLI merge) ---
+    from agent_runner.config import AgentConfig
+
+    if args.config:
+        cfg = AgentConfig.from_file(args.config)
+    else:
+        cfg = AgentConfig.discover() or AgentConfig()
+    cfg.merge_cli(args)
 
     # --- Replay approved runs ---
     if args.replay:
@@ -154,17 +181,15 @@ def main() -> None:
     # --- MCP bridge ---
     mcp_client = None
     mcp_bridge = None
-    if args.mcp:
+    if cfg.mcp and cfg.mcp.command:
         from agent_runner.mcp.client import MCPClient
         from agent_runner.mcp.bridge import MCPToolBridge
 
-        mcp_command = args.mcp.split()
+        mcp_command = cfg.mcp.command.split()
         mcp_client = MCPClient(command=mcp_command)
         mcp_client.start()
 
-        mcp_write_names = set()
-        if args.mcp_writes:
-            mcp_write_names = {t.strip() for t in args.mcp_writes.split(",")}
+        mcp_write_names = set(cfg.mcp.write_tools)
 
         mcp_bridge = MCPToolBridge(
             client=mcp_client,
@@ -178,12 +203,11 @@ def main() -> None:
     # --- Interceptors ---
     interceptors = []
 
-    # Always log
     log_interceptor = LoggingInterceptor()
     interceptors.append(log_interceptor)
 
     shadow_interceptor = None
-    if args.shadow:
+    if cfg.shadow:
         write_tools = {"write_file", "shell"}
         read_tools = {"read_file", "calculator"}
         if mcp_bridge:
@@ -194,31 +218,38 @@ def main() -> None:
         )
         interceptors.append(shadow_interceptor)
 
-    if args.approve:
-        tool_names = {t.strip() for t in args.approve.split(",")}
-        interceptors.append(ApprovalInterceptor(require_approval_for=tool_names))
-
-    # --- System prompt ---
-    system_prompt = (
-        "You are a helpful assistant with access to tools. "
-        "Use the available tools to accomplish the user's request. "
-        "Think step-by-step and use tools as needed."
-    )
+    if cfg.approve:
+        interceptors.append(ApprovalInterceptor(require_approval_for=set(cfg.approve)))
 
     # --- Runner ---
-    runner_kwargs = {"system_prompt": system_prompt, "tools": registry, "interceptors": interceptors}
-    if args.model:
-        runner_kwargs["model"] = args.model
-    if args.max_turns:
-        runner_kwargs["max_turns"] = args.max_turns
+    on_text = None
+    if cfg.stream:
+        on_text = lambda chunk: print(chunk, end="", flush=True)
+
+    runner_kwargs: dict[str, Any] = {
+        "system_prompt": cfg.system_prompt,
+        "tools": registry,
+        "interceptors": interceptors,
+        "on_text": on_text,
+    }
+    if cfg.model:
+        runner_kwargs["model"] = cfg.model
+    runner_kwargs["max_turns"] = cfg.max_turns
 
     runner = AgentRunner(**runner_kwargs)
 
     # --- Execute ---
     def _handle_result(prompt: str, result: Any) -> None:
         """Display a run result and handle shadow captures."""
-        print(f"\n--- Response ({result.turns_used} turns) ---")
-        print(result.final_text)
+        if cfg.stream:
+            print()  # newline after streamed output
+
+        print(f"\n--- Response ({result.turns_used} turns, "
+              f"{result.usage.total_tokens} tokens, "
+              f"{result.elapsed_seconds:.1f}s, "
+              f"~${result.usage.estimated_cost(runner.model):.4f}) ---")
+        if not cfg.stream:
+            print(result.final_text)
 
         if result.tool_call_log:
             print(f"\n--- Tool Calls ({len(result.tool_call_log)}) ---")
@@ -230,7 +261,7 @@ def main() -> None:
             for cap in shadow_interceptor.captured_writes:
                 print(f"  {cap['tool']}: {json.dumps(cap['input'], default=str)[:120]}")
 
-            if args.share:
+            if cfg.share:
                 from agent_runner.sharing.run_store import RunStore
 
                 store = RunStore()

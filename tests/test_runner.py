@@ -28,8 +28,12 @@ def _tool_use_block(name: str, input_: dict, id_: str = "tool_1"):
     return SimpleNamespace(type="tool_use", name=name, input=input_, id=id_)
 
 
-def _api_response(content: list, stop_reason: str = "end_turn"):
-    return SimpleNamespace(content=content, stop_reason=stop_reason)
+def _api_response(content: list, stop_reason: str = "end_turn", input_tokens: int = 100, output_tokens: int = 50):
+    return SimpleNamespace(
+        content=content,
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
+    )
 
 
 # ---- ToolRegistry tests ----
@@ -215,3 +219,21 @@ class TestAgentRunner:
         assert len(r2.messages) == 4
         assert r2.messages[0]["content"] == "Hello"
         assert r2.messages[2]["content"] == "Follow up"
+
+    @patch("agent_runner.runner.anthropic.Anthropic")
+    def test_usage_tracking(self, mock_cls):
+        """Verify token usage is accumulated across turns."""
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        mock_client.messages.create.side_effect = [
+            _api_response([_tool_use_block("echo", {"msg": "x"})], "tool_use", 200, 80),
+            _api_response([_text_block("Done")], "end_turn", 300, 40),
+        ]
+
+        runner = self._make_runner()
+        result = runner.run("test")
+        assert result.usage.input_tokens == 500
+        assert result.usage.output_tokens == 120
+        assert result.usage.total_tokens == 620
+        assert result.elapsed_seconds > 0
