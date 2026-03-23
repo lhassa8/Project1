@@ -22,6 +22,31 @@ class Interceptor:
 
     The interceptor chain is evaluated in order.  The first interceptor that
     returns anything other than ``ALLOW`` short-circuits the chain.
+
+    Example — rate-limiting interceptor::
+
+        import time
+
+        class RateLimitInterceptor(Interceptor):
+            def __init__(self, max_calls: int, window: float = 60.0):
+                self.max_calls = max_calls
+                self.window = window
+                self._timestamps: list[float] = []
+
+            def intercept(self, tool_name, tool_input):
+                now = time.monotonic()
+                self._timestamps = [t for t in self._timestamps if now - t < self.window]
+                if len(self._timestamps) >= self.max_calls:
+                    return InterceptAction.DENY, None
+                self._timestamps.append(now)
+                return InterceptAction.ALLOW, tool_input
+
+    Example — PII redaction interceptor::
+
+        class RedactPIIInterceptor(Interceptor):
+            def intercept(self, tool_name, tool_input):
+                sanitized = {k: redact(v) for k, v in tool_input.items()}
+                return InterceptAction.ALLOW, sanitized
     """
 
     def intercept(

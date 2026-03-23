@@ -33,24 +33,34 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-# Known event names for documentation; arbitrary strings are also accepted.
-KNOWN_EVENTS = frozenset({
-    "run_start",       # (user_message: str)
-    "turn_start",      # (turn_number: int, messages: list)
-    "turn_end",        # (turn_number: int, stop_reason: str)
-    "tool_call",       # (tool_name: str, tool_input: dict, action: str, output: Any)
-    "run_complete",    # (result: RunResult)
-})
+# Known event names and their signatures for documentation and validation.
+KNOWN_EVENTS: dict[str, str] = {
+    "run_start":    "(user_message: str)",
+    "turn_start":   "(turn_number: int, messages: list)",
+    "turn_end":     "(turn_number: int, stop_reason: str)",
+    "tool_call":    "(tool_name: str, tool_input: dict, action: str, output: Any)",
+    "run_complete": "(result: RunResult)",
+}
 
 
 class HookManager:
-    """Registry for lifecycle callbacks."""
+    """Registry for lifecycle callbacks.
 
-    def __init__(self) -> None:
+    By default, registering a hook on an unknown event name logs a warning
+    to help catch typos.  Set ``strict=True`` to raise instead::
+
+        hooks = HookManager(strict=True)
+        hooks.on("trun_start")  # raises ValueError — did you mean turn_start?
+    """
+
+    def __init__(self, strict: bool = False) -> None:
         self._listeners: dict[str, list[Callable[..., Any]]] = defaultdict(list)
+        self.strict = strict
 
     def on(self, event: str) -> Callable:
         """Decorator to register a callback for *event*."""
+        self._check_event(event)
+
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             self._listeners[event].append(fn)
             return fn
@@ -58,6 +68,7 @@ class HookManager:
 
     def register(self, event: str, callback: Callable[..., Any]) -> None:
         """Imperatively register a callback (alternative to decorator)."""
+        self._check_event(event)
         self._listeners[event].append(callback)
 
     def emit(self, event: str, *args: Any, **kwargs: Any) -> None:
@@ -77,3 +88,16 @@ class HookManager:
             self._listeners.pop(event, None)
         else:
             self._listeners.clear()
+
+    @staticmethod
+    def list_events() -> dict[str, str]:
+        """Return known event names with their callback signatures."""
+        return dict(KNOWN_EVENTS)
+
+    def _check_event(self, event: str) -> None:
+        """Warn or raise on unrecognized event names."""
+        if event not in KNOWN_EVENTS:
+            msg = f"Unknown hook event '{event}'. Known events: {', '.join(sorted(KNOWN_EVENTS))}"
+            if self.strict:
+                raise ValueError(msg)
+            logger.warning(msg)

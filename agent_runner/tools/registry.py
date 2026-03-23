@@ -48,10 +48,17 @@ class ToolRegistry:
         @registry.simple_tool("add", "Add two numbers", a=float, b=float)
         def add(params):
             return params["a"] + params["b"]
+
+    Parameters
+    ----------
+    validate_schemas : bool
+        If True (default), validate ``input_schema`` at registration time
+        to catch misconfigured tools early.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, validate_schemas: bool = True) -> None:
         self._tools: dict[str, ToolDef] = {}
+        self._validate_schemas = validate_schemas
 
     # ------------------------------------------------------------------
     # Registration
@@ -66,6 +73,8 @@ class ToolRegistry:
         is_write: bool = False,
     ) -> Callable:
         """Decorator that registers a handler function as a tool."""
+        if self._validate_schemas:
+            self._check_schema(name, input_schema)
 
         def decorator(fn: ToolHandler) -> ToolHandler:
             self._tools[name] = ToolDef(
@@ -118,6 +127,8 @@ class ToolRegistry:
         is_write: bool = False,
     ) -> None:
         """Imperatively register a tool (alternative to the decorator)."""
+        if self._validate_schemas:
+            self._check_schema(name, input_schema)
         self._tools[name] = ToolDef(
             name=name,
             description=description,
@@ -158,6 +169,45 @@ class ToolRegistry:
     def read_tools(self) -> set[str]:
         """Return names of all tools NOT marked as write operations."""
         return {t.name for t in self._tools.values() if not t.is_write}
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_schema(tool_name: str, schema: dict[str, Any]) -> None:
+        """Validate that *schema* is a well-formed JSON Schema for tool input.
+
+        Raises ``ValueError`` with a clear message if it's misconfigured,
+        catching common mistakes at registration time instead of at runtime.
+        """
+        if not isinstance(schema, dict):
+            raise ValueError(
+                f"Tool '{tool_name}': input_schema must be a dict, got {type(schema).__name__}"
+            )
+        if schema.get("type") != "object":
+            raise ValueError(
+                f"Tool '{tool_name}': input_schema.type must be 'object', "
+                f"got {schema.get('type')!r}"
+            )
+        props = schema.get("properties")
+        if props is not None and not isinstance(props, dict):
+            raise ValueError(
+                f"Tool '{tool_name}': input_schema.properties must be a dict"
+            )
+        required = schema.get("required")
+        if required is not None:
+            if not isinstance(required, list):
+                raise ValueError(
+                    f"Tool '{tool_name}': input_schema.required must be a list"
+                )
+            if props:
+                unknown = set(required) - set(props)
+                if unknown:
+                    raise ValueError(
+                        f"Tool '{tool_name}': required fields {unknown} "
+                        f"not found in properties"
+                    )
 
     # ------------------------------------------------------------------
     # API serialization

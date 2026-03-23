@@ -102,7 +102,7 @@ class TestToolMetadata:
 
     def test_has(self):
         r = ToolRegistry()
-        r.register("test", "test", {}, lambda p: None)
+        r.register("test", "test", {"type": "object", "properties": {}}, lambda p: None)
         assert r.has("test")
         assert not r.has("nope")
 
@@ -302,3 +302,102 @@ class TestMaxTokens:
 
         call_kwargs = mock_client.messages.create.call_args
         assert call_kwargs.kwargs.get("max_tokens") == 8192 or call_kwargs[1].get("max_tokens") == 8192
+
+
+# ---- Schema validation at registration ----
+
+class TestSchemaValidation:
+    def test_rejects_non_object_type(self):
+        r = ToolRegistry()
+        with pytest.raises(ValueError, match="must be 'object'"):
+            r.register("bad", "desc", {"type": "string"}, lambda p: None)
+
+    def test_rejects_non_dict_schema(self):
+        r = ToolRegistry()
+        with pytest.raises(ValueError, match="must be a dict"):
+            r.register("bad", "desc", "not a dict", lambda p: None)
+
+    def test_rejects_unknown_required_fields(self):
+        r = ToolRegistry()
+        with pytest.raises(ValueError, match="not found in properties"):
+            r.register("bad", "desc", {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a", "b"],
+            }, lambda p: None)
+
+    def test_validation_can_be_disabled(self):
+        r = ToolRegistry(validate_schemas=False)
+        # Should NOT raise even with bad schema
+        r.register("bad", "desc", {"type": "string"}, lambda p: None)
+        assert r.has("bad")
+
+    def test_decorator_also_validates(self):
+        r = ToolRegistry()
+        with pytest.raises(ValueError, match="must be 'object'"):
+            @r.tool("bad", "desc", {"type": "array"})
+            def handler(p):
+                pass
+
+
+# ---- Hook event validation ----
+
+class TestHookValidation:
+    def test_strict_mode_raises_on_typo(self):
+        from agent_runner.hooks import HookManager
+        hooks = HookManager(strict=True)
+        with pytest.raises(ValueError, match="Unknown hook event"):
+            hooks.on("trun_start")
+
+    def test_non_strict_logs_warning(self):
+        from agent_runner.hooks import HookManager
+        hooks = HookManager(strict=False)
+        # Should not raise, just warn
+        @hooks.on("trun_start")
+        def callback():
+            pass
+
+    def test_list_events(self):
+        from agent_runner.hooks import HookManager
+        events = HookManager.list_events()
+        assert "run_start" in events
+        assert "tool_call" in events
+        assert isinstance(events["run_start"], str)
+
+    def test_known_events_accepted_in_strict(self):
+        from agent_runner.hooks import HookManager
+        hooks = HookManager(strict=True)
+        @hooks.on("run_start")
+        def callback(msg):
+            pass
+        assert hooks.has_listeners("run_start")
+
+
+# ---- Structured error tracking in tool execution ----
+
+class TestStructuredErrors:
+    @patch("agent_runner.runner.anthropic.Anthropic")
+    def test_error_captured_in_call_record(self, mock_cls):
+        mock_client = MagicMock()
+        mock_cls.return_value = mock_client
+
+        # First call: tool use. Second call: end turn.
+        mock_client.messages.create.side_effect = [
+            _api_response(
+                [_tool_use_block("bad_tool", {})],
+                stop_reason="tool_use",
+            ),
+            _api_response([_text_block("done")]),
+        ]
+
+        r = ToolRegistry()
+        # Register a tool that raises
+        r.register("bad_tool", "desc", {"type": "object", "properties": {}}, lambda p: 1 / 0)
+
+        runner = AgentRunner(system_prompt="Test", tools=r, api_key="fake")
+        result = runner.run("test")
+
+        assert len(result.tool_call_log) == 1
+        assert result.tool_call_log[0]["error"] is not None
+        assert "division by zero" in result.tool_call_log[0]["error"]
+        assert len(result.failed_tools()) == 1

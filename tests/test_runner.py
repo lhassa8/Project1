@@ -132,7 +132,7 @@ class TestInterceptors:
         si.intercept("write_file", {"path": "x.txt", "content": "hi"})
 
         registry = ToolRegistry()
-        registry.register("write_file", "w", {}, lambda p: f"wrote {p['path']}")
+        registry.register("write_file", "w", {"type": "object", "properties": {}}, lambda p: f"wrote {p['path']}")
         results = si.replay(registry)
         assert len(results) == 1
         assert "wrote x.txt" in results[0]["output"]

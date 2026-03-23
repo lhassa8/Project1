@@ -315,7 +315,7 @@ class AgentRunner:
             call_record["action"] = action.value
 
             if action == InterceptAction.ALLOW:
-                output = self._execute_tool(block.name, modified_input)
+                output = self._execute_tool(block.name, modified_input, call_record)
                 call_record["output"] = output
                 tool_results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}
@@ -351,16 +351,22 @@ class AgentRunner:
                 return action, current_input
         return InterceptAction.ALLOW, current_input
 
-    def _execute_tool(self, name: str, tool_input: dict[str, Any]) -> Any:
+    def _execute_tool(self, name: str, tool_input: dict[str, Any], call_record: dict[str, Any] | None = None) -> Any:
         """Look up and execute a registered tool."""
         handler = self.tools.get(name)
         if handler is None:
-            return f"Error: unknown tool '{name}'"
+            error_msg = f"Error: unknown tool '{name}'"
+            if call_record is not None:
+                call_record["error"] = error_msg
+            return error_msg
         try:
             return handler(tool_input)
         except Exception as exc:
             logger.exception("Tool '%s' raised an exception", name)
-            return f"Error executing tool '{name}': {exc}"
+            error_msg = f"Error executing tool '{name}': {exc}"
+            if call_record is not None:
+                call_record["error"] = error_msg
+            return error_msg
 
     @staticmethod
     def _extract_text(content: list) -> str:
