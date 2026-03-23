@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("prompt", nargs="?", help="User prompt (omit for interactive mode)")
     p.add_argument("--model", default=None, help="Claude model to use")
     p.add_argument("--max-turns", type=int, default=25, help="Max tool-call round trips")
+    p.add_argument("--max-tokens", type=int, default=4096, help="Max response tokens per API call")
     p.add_argument(
         "--shadow",
         action="store_true",
@@ -208,8 +209,9 @@ def main() -> None:
 
     shadow_interceptor = None
     if cfg.shadow:
-        write_tools = {"write_file", "shell"}
-        read_tools = {"read_file", "list_files", "calculator"}
+        # Auto-detect from registry metadata; merge MCP tools if bridged
+        write_tools = registry.write_tools()
+        read_tools = registry.read_tools()
         if mcp_bridge:
             write_tools |= mcp_bridge.get_write_tools()
             read_tools |= mcp_bridge.get_read_tools()
@@ -231,10 +233,11 @@ def main() -> None:
         "tools": registry,
         "interceptors": interceptors,
         "on_text": on_text,
+        "max_turns": cfg.max_turns,
+        "max_tokens": cfg.max_tokens,
     }
     if cfg.model:
         runner_kwargs["model"] = cfg.model
-    runner_kwargs["max_turns"] = cfg.max_turns
 
     runner = AgentRunner(**runner_kwargs)
 

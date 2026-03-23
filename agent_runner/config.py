@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,7 @@ class AgentConfig:
 
     model: str | None = None
     max_turns: int = 25
+    max_tokens: int = 4096
     system_prompt: str = (
         "You are a helpful assistant with access to tools. "
         "Use the available tools to accomplish the user's request. "
@@ -67,14 +69,17 @@ class AgentConfig:
             raise FileNotFoundError(f"Config file not found: {path}")
 
         text = path.read_text()
-        if path.suffix in (".yaml", ".yml"):
-            try:
-                import yaml
-                data = yaml.safe_load(text)
-            except ImportError:
-                raise ImportError("PyYAML is required for YAML config files: pip install pyyaml")
-        else:
-            data = json.loads(text)
+        try:
+            if path.suffix in (".yaml", ".yml"):
+                try:
+                    import yaml
+                    data = yaml.safe_load(text)
+                except ImportError:
+                    raise ImportError("PyYAML is required for YAML config files: pip install pyyaml")
+            else:
+                data = json.loads(text)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"Failed to parse config file {path}: {exc}") from exc
 
         return cls._from_dict(data)
 
@@ -91,6 +96,7 @@ class AgentConfig:
         return cls(
             model=data.get("model"),
             max_turns=data.get("max_turns", 25),
+            max_tokens=data.get("max_tokens", 4096),
             system_prompt=data.get("system_prompt", cls.system_prompt),
             shadow=data.get("shadow", False),
             share=data.get("share", False),
@@ -102,7 +108,12 @@ class AgentConfig:
 
     @classmethod
     def discover(cls) -> AgentConfig | None:
-        """Look for a config file in the default locations."""
+        """Look for a config file — checks ``AGENT_CONFIG`` env var first,
+        then default file locations (``agent.json``, ``agent.yaml``)."""
+        env_path = os.getenv("AGENT_CONFIG")
+        if env_path:
+            logger.info("Using config from AGENT_CONFIG=%s", env_path)
+            return cls.from_file(env_path)
         for name in DEFAULT_CONFIG_PATHS:
             path = Path(name)
             if path.exists():
@@ -116,6 +127,8 @@ class AgentConfig:
             self.model = args.model
         if getattr(args, "max_turns", None) and args.max_turns != 25:
             self.max_turns = args.max_turns
+        if getattr(args, "max_tokens", None) and args.max_tokens != 4096:
+            self.max_tokens = args.max_tokens
         if getattr(args, "shadow", False):
             self.shadow = True
         if getattr(args, "share", False):

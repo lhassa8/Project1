@@ -1,6 +1,6 @@
 """Built-in tools that ship with the runner.
 
-These are simple, safe, read-only tools useful for demos and testing.
+These are simple, safe tools useful for demos and testing.
 Production deployments will register their own domain-specific tools.
 """
 
@@ -31,6 +31,7 @@ def register_builtins(registry: ToolRegistry) -> None:
             },
             "required": ["expression"],
         },
+        category="compute",
     )
     def calculator(params: dict[str, Any]) -> str:
         expr = params["expression"]
@@ -57,6 +58,8 @@ def register_builtins(registry: ToolRegistry) -> None:
             },
             "required": ["command"],
         },
+        category="system",
+        is_write=True,
     )
     def shell(params: dict[str, Any]) -> str:
         cmd = params["command"]
@@ -92,6 +95,7 @@ def register_builtins(registry: ToolRegistry) -> None:
             },
             "required": ["path"],
         },
+        category="file",
     )
     def read_file(params: dict[str, Any]) -> str:
         try:
@@ -118,6 +122,7 @@ def register_builtins(registry: ToolRegistry) -> None:
                 },
             },
         },
+        category="file",
     )
     def list_files(params: dict[str, Any]) -> str:
         path = params.get("path", ".")
@@ -161,6 +166,8 @@ def register_builtins(registry: ToolRegistry) -> None:
             },
             "required": ["path", "content"],
         },
+        category="file",
+        is_write=True,
     )
     def write_file(params: dict[str, Any]) -> str:
         try:

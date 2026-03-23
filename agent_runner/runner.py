@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Default limits
 DEFAULT_MAX_TURNS = 25
+DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
 
@@ -65,6 +66,43 @@ class RunResult:
     usage: TokenUsage = field(default_factory=TokenUsage)
     elapsed_seconds: float = 0.0
 
+    def failed_tools(self) -> list[dict[str, Any]]:
+        """Return tool calls that resulted in errors."""
+        return [c for c in self.tool_call_log if c.get("error")]
+
+
+class Conversation:
+    """Manages multi-turn conversation state.
+
+    Usage::
+
+        conv = runner.conversation()
+        r1 = conv.ask("Hello!")
+        r2 = conv.ask("Follow up question")   # carries full history
+        r3 = conv.ask("One more")
+        print(conv.total_usage.total_tokens)
+    """
+
+    def __init__(self, runner: AgentRunner) -> None:
+        self._runner = runner
+        self._messages: list[dict[str, Any]] = []
+        self.total_usage = TokenUsage()
+        self.results: list[RunResult] = []
+
+    def ask(self, message: str) -> RunResult:
+        """Send a message and get the response, carrying forward full history."""
+        result = self._runner.run(message, conversation=self._messages)
+        self._messages = result.messages
+        self.total_usage.add(result.usage.input_tokens, result.usage.output_tokens)
+        self.results.append(result)
+        return result
+
+    def reset(self) -> None:
+        """Clear conversation history and start fresh."""
+        self._messages.clear()
+        self.results.clear()
+        self.total_usage = TokenUsage()
+
 
 class AgentRunner:
     """Execute a multi-turn Claude conversation with native tool-call handling.
@@ -81,6 +119,8 @@ class AgentRunner:
         The Claude model to use.
     max_turns : int
         Hard ceiling on tool-call round-trips to prevent runaway loops.
+    max_tokens : int
+        Maximum response tokens per API call.
     api_key : str | None
         Anthropic API key.  Falls back to ``ANTHROPIC_API_KEY`` env var.
     on_text : Callable[[str], None] | None
@@ -88,6 +128,10 @@ class AgentRunner:
         If provided, the runner uses the streaming API.
     hooks : HookManager | None
         Lifecycle event hooks for observing runner events.
+    retries : int
+        Number of retries on transient API errors (rate limits, timeouts).
+    retry_delay : float
+        Initial delay in seconds between retries (doubles each attempt).
     """
 
     def __init__(
@@ -97,17 +141,23 @@ class AgentRunner:
         interceptors: list[Interceptor] | None = None,
         model: str = DEFAULT_MODEL,
         max_turns: int = DEFAULT_MAX_TURNS,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         api_key: str | None = None,
         on_text: Callable[[str], None] | None = None,
         hooks: HookManager | None = None,
+        retries: int = 2,
+        retry_delay: float = 1.0,
     ) -> None:
         self.system_prompt = system_prompt
         self.tools = tools
         self.interceptors = interceptors or []
         self.model = model
         self.max_turns = max_turns
+        self.max_tokens = max_tokens
         self.on_text = on_text
         self.hooks = hooks or HookManager()
+        self.retries = retries
+        self.retry_delay = retry_delay
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     # ------------------------------------------------------------------
@@ -178,15 +228,49 @@ class AgentRunner:
         self.hooks.emit("run_complete", result)
         return result
 
+    def conversation(self) -> Conversation:
+        """Create a new multi-turn conversation context.
+
+        Usage::
+
+            conv = runner.conversation()
+            r1 = conv.ask("Hello")
+            r2 = conv.ask("Follow up")  # carries history automatically
+        """
+        return Conversation(self)
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
+    def _call_with_retry(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Call *fn* with exponential backoff on transient errors."""
+        delay = self.retry_delay
+        last_exc = None
+        for attempt in range(1 + self.retries):
+            try:
+                return fn(*args, **kwargs)
+            except (
+                anthropic.RateLimitError,
+                anthropic.APIConnectionError,
+                anthropic.InternalServerError,
+            ) as exc:
+                last_exc = exc
+                if attempt < self.retries:
+                    logger.warning(
+                        "API call failed (attempt %d/%d): %s — retrying in %.1fs",
+                        attempt + 1, 1 + self.retries, exc, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+        raise last_exc  # type: ignore[misc]
+
     def _call_api(self, messages: list[dict[str, Any]]) -> Any:
-        """Single Claude API call (non-streaming)."""
-        return self._client.messages.create(
+        """Single Claude API call (non-streaming) with retry."""
+        return self._call_with_retry(
+            self._client.messages.create,
             model=self.model,
-            max_tokens=4096,
+            max_tokens=self.max_tokens,
             system=self.system_prompt,
             tools=self.tools.to_api_schema(),
             messages=messages,
@@ -194,16 +278,18 @@ class AgentRunner:
 
     def _call_api_streaming(self, messages: list[dict[str, Any]]) -> Any:
         """Streaming Claude API call — invokes on_text for each text delta."""
-        with self._client.messages.stream(
-            model=self.model,
-            max_tokens=4096,
-            system=self.system_prompt,
-            tools=self.tools.to_api_schema(),
-            messages=messages,
-        ) as stream:
-            for text in stream.text_stream:
-                self.on_text(text)
-            return stream.get_final_message()
+        def _do_stream() -> Any:
+            with self._client.messages.stream(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=self.system_prompt,
+                tools=self.tools.to_api_schema(),
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    self.on_text(text)
+                return stream.get_final_message()
+        return self._call_with_retry(_do_stream)
 
     def _process_tool_calls(
         self, assistant_content: list, result: RunResult
@@ -215,12 +301,13 @@ class AgentRunner:
             if block.type != "tool_use":
                 continue
 
-            call_record = {
+            call_record: dict[str, Any] = {
                 "tool": block.name,
                 "input": block.input,
                 "id": block.id,
                 "action": None,
                 "output": None,
+                "error": None,
             }
 
             # --- Interception pipeline ---

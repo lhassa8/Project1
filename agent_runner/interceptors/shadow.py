@@ -35,6 +35,20 @@ class ShadowInterceptor(Interceptor):
         self.read_tools = read_tools or {"read_file", "list_files", "calculator"}
         self.captured_writes: list[dict[str, Any]] = []
 
+    @classmethod
+    def from_registry(cls, registry: Any) -> ShadowInterceptor:
+        """Auto-configure from a ToolRegistry's ``is_write`` metadata.
+
+        Uses ``registry.write_tools()`` and ``registry.read_tools()``
+        so you don't have to maintain separate sets::
+
+            shadow = ShadowInterceptor.from_registry(registry)
+        """
+        return cls(
+            write_tools=registry.write_tools(),
+            read_tools=registry.read_tools(),
+        )
+
     def intercept(
         self, tool_name: str, tool_input: dict[str, Any]
     ) -> tuple[InterceptAction, Any]:
