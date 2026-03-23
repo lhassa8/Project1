@@ -30,6 +30,7 @@ Usage::
 from __future__ import annotations
 
 import copy
+import os
 from typing import Any
 
 from agent_runner.interceptors.base import InterceptAction, Interceptor
@@ -128,10 +129,10 @@ class ShadowInterceptor(Interceptor):
         if tool_name == "list_files":
             path = tool_input.get("path", ".")
             recursive = tool_input.get("recursive", False)
-            # Always merge virtual + real for list_files
-            if self.state.has_changes():
+            # Only merge if virtual changes exist under this specific path
+            if self.state._has_virtual_entries_under(os.path.abspath(path)):
                 return self.state.list_files(path, recursive)
-            return None  # no virtual changes, use real tool
+            return None  # no virtual changes under this path, use real tool
 
         return None  # tool not handled, fall through
 

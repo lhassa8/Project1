@@ -60,6 +60,19 @@ class AgentConfig:
     approve: list[str] = field(default_factory=list)
     mcp: MCPConfig | None = None
     tools: dict[str, bool] = field(default_factory=dict)
+    # Security & sandbox
+    sandbox_roots: list[str] = field(default_factory=list)
+    sandbox_deny: list[str] = field(default_factory=lambda: ["*.key", "*.pem", ".env*"])
+    shell_allow: list[str] = field(default_factory=list)
+    shell_deny: list[str] = field(default_factory=lambda: ["sudo"])
+    # Resource limits
+    max_tool_calls: int = 0
+    max_cost_usd: float = 0.0
+    # Observability
+    audit: bool = False
+    audit_path: str = ".agent_audit.jsonl"
+    # Approval policy
+    approval_policy: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_file(cls, path: str | Path) -> AgentConfig:
@@ -104,6 +117,15 @@ class AgentConfig:
             approve=data.get("approve", []),
             mcp=mcp,
             tools=data.get("tools", {}),
+            sandbox_roots=data.get("sandbox_roots", []),
+            sandbox_deny=data.get("sandbox_deny", ["*.key", "*.pem", ".env*"]),
+            shell_allow=data.get("shell_allow", []),
+            shell_deny=data.get("shell_deny", ["sudo"]),
+            max_tool_calls=data.get("max_tool_calls", 0),
+            max_cost_usd=data.get("max_cost_usd", 0.0),
+            audit=data.get("audit", False),
+            audit_path=data.get("audit_path", ".agent_audit.jsonl"),
+            approval_policy=data.get("approval_policy", []),
         )
 
     @classmethod

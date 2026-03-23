@@ -304,3 +304,18 @@ class TestShadowInterceptorVirtualFS:
 
         diff = ShadowDiff(si.state)
         assert "CREATE" in diff.summary()
+
+    def test_list_files_unrelated_dir_passes_through(self, tmp_path):
+        """Listing a dir with no virtual changes should fall through to real tool."""
+        si = ShadowInterceptor()
+        # Write to /tmp, but list a completely different directory
+        si.intercept("write_file", {"path": str(tmp_path / "sub" / "x.txt"), "content": "v"})
+
+        # Listing tmp_path itself (not tmp_path/sub) — no virtual entries directly here
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        (other_dir / "real.txt").write_text("r")
+
+        action, result = si.intercept("list_files", {"path": str(other_dir)})
+        # Should ALLOW (pass through) since no virtual changes under other_dir
+        assert action == InterceptAction.ALLOW

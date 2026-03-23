@@ -18,6 +18,12 @@ Usage::
     # With approval gate on dangerous tools
     python main.py --approve shell,write_file "List files in /tmp"
 
+    # With sandbox (restrict to project directory)
+    python main.py --sandbox-roots ./src,/tmp "Read the config file"
+
+    # With cost budget
+    python main.py --max-cost 2.00 "Refactor all files"
+
     # Bridge an MCP server's tools into the runner
     python main.py --mcp "npx -y @modelcontextprotocol/server-filesystem /tmp" "List files"
 
@@ -48,6 +54,10 @@ from agent_runner.tools.builtins import register_builtins
 from agent_runner.interceptors.logging import LoggingInterceptor
 from agent_runner.interceptors.approval import ApprovalInterceptor
 from agent_runner.interceptors.shadow import ShadowInterceptor
+from agent_runner.sandbox import PathSandbox, ShellPolicy, ResourceLimits
+from agent_runner.events import EventStream
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +86,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Comma-separated tool names requiring human approval",
+    )
+    p.add_argument(
+        "--sandbox-roots",
+        type=str,
+        default=None,
+        help="Comma-separated allowed directories for file operations (default: cwd)",
+    )
+    p.add_argument(
+        "--shell-allow",
+        type=str,
+        default=None,
+        help="Comma-separated allowed shell commands (allowlist mode)",
+    )
+    p.add_argument(
+        "--max-cost",
+        type=float,
+        default=0.0,
+        help="Max cost budget in USD (0 = unlimited)",
+    )
+    p.add_argument(
+        "--audit",
+        action="store_true",
+        help="Enable audit trail logging to .agent_audit.jsonl",
     )
     p.add_argument(
         "--mcp",
@@ -128,6 +161,16 @@ def main() -> None:
         cfg = AgentConfig.discover() or AgentConfig()
     cfg.merge_cli(args)
 
+    # Merge new CLI args into config
+    if getattr(args, "sandbox_roots", None):
+        cfg.sandbox_roots = [r.strip() for r in args.sandbox_roots.split(",")]
+    if getattr(args, "shell_allow", None):
+        cfg.shell_allow = [c.strip() for c in args.shell_allow.split(",")]
+    if getattr(args, "max_cost", 0.0) > 0:
+        cfg.max_cost_usd = args.max_cost
+    if getattr(args, "audit", False):
+        cfg.audit = True
+
     # --- Replay approved runs ---
     if args.replay:
         from agent_runner.sharing.run_store import RunStore, RunStatus
@@ -175,9 +218,26 @@ def main() -> None:
             print("\nShutting down.")
         return
 
+    # --- Sandbox ---
+    path_sandbox = None
+    if cfg.sandbox_roots:
+        path_sandbox = PathSandbox(
+            allowed_roots=cfg.sandbox_roots,
+            denied_patterns=cfg.sandbox_deny,
+        )
+        logger.info("Path sandbox: roots=%s, deny=%s", cfg.sandbox_roots, cfg.sandbox_deny)
+
+    shell_policy = None
+    if cfg.shell_allow or cfg.shell_deny:
+        shell_policy = ShellPolicy(
+            allow=cfg.shell_allow or None,
+            deny=cfg.shell_deny or None,
+        )
+        logger.info("Shell policy: allow=%s, deny=%s", cfg.shell_allow, cfg.shell_deny)
+
     # --- Tools ---
     registry = ToolRegistry()
-    register_builtins(registry)
+    register_builtins(registry, path_sandbox=path_sandbox, shell_policy=shell_policy)
 
     # --- MCP bridge ---
     mcp_client = None
@@ -199,7 +259,7 @@ def main() -> None:
             write_tool_names=mcp_write_names,
         )
         bridged = mcp_bridge.bridge_tools()
-        print(f"Bridged {len(bridged)} MCP tools: {bridged}")
+        logger.info("Bridged %d MCP tools: %s", len(bridged), bridged)
 
     # --- Interceptors ---
     interceptors = []
@@ -220,8 +280,61 @@ def main() -> None:
         )
         interceptors.append(shadow_interceptor)
 
-    if cfg.approve:
+    # Approval: use policy if configured, otherwise simple tool list
+    if cfg.approval_policy:
+        from agent_runner.approval_policy import ApprovalPolicy
+
+        policy = ApprovalPolicy.from_config(cfg.approval_policy)
+
+        def _policy_approval(tool_name: str, tool_input: dict) -> bool:
+            defn = registry.get_def(tool_name)
+            is_write = defn.is_write if defn else False
+            decision = policy.evaluate(tool_name, tool_input, is_write=is_write)
+            if decision == "auto_approve":
+                return True
+            if decision == "auto_deny":
+                return False
+            # "require_review" — fall through to interactive prompt
+            print(f"\n--- Approval Required (policy: require_review) ---")
+            print(f"Tool:  {tool_name}")
+            print(f"Input: {json.dumps(tool_input, indent=2, default=str)[:500]}")
+            answer = input("Allow? [y/N] ").strip().lower()
+            return answer in ("y", "yes")
+
+        interceptors.append(ApprovalInterceptor(on_approval=_policy_approval))
+        logger.info("Using approval policy with %d rules", len(policy.rules))
+    elif cfg.approve:
         interceptors.append(ApprovalInterceptor(require_approval_for=set(cfg.approve)))
+
+    # --- Resource limits ---
+    resource_limits = ResourceLimits(
+        max_tool_calls=cfg.max_tool_calls,
+        max_cost_usd=cfg.max_cost_usd,
+    )
+
+    # --- Event stream ---
+    event_stream = EventStream()
+
+    # --- Audit trail ---
+    audit_log = None
+    if cfg.audit:
+        from agent_runner.sharing.audit import AuditLog, AuditEntry
+        import time as _time
+
+        audit_log = AuditLog(path=cfg.audit_path)
+        logger.info("Audit trail enabled: %s", cfg.audit_path)
+
+        def _audit_handler(event):
+            audit_log.record(AuditEntry(
+                timestamp=_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                event=event.event_type,
+                run_id=event.run_id,
+                tool=event.data.get("tool"),
+                reviewer=None,
+                details=event.data,
+            ))
+
+        event_stream.on_event(_audit_handler)
 
     # --- Runner ---
     on_text = None
@@ -235,6 +348,8 @@ def main() -> None:
         "on_text": on_text,
         "max_turns": cfg.max_turns,
         "max_tokens": cfg.max_tokens,
+        "resource_limits": resource_limits,
+        "event_stream": event_stream,
     }
     if cfg.model:
         runner_kwargs["model"] = cfg.model
@@ -257,12 +372,16 @@ def main() -> None:
         if result.tool_call_log:
             print(f"\n--- Tool Calls ({len(result.tool_call_log)}) ---")
             for call in result.tool_call_log:
-                print(f"  {call['tool']}  [{call['action']}]")
+                status = f"  {call['tool']}  [{call['action']}]"
+                if call.get("error"):
+                    status += f"  ERROR: {call['error'][:80]}"
+                print(status)
 
         if shadow_interceptor and shadow_interceptor.captured_writes:
-            print(f"\n--- Shadow Captures ({len(shadow_interceptor.captured_writes)}) ---")
-            for cap in shadow_interceptor.captured_writes:
-                print(f"  {cap['tool']}: {json.dumps(cap['input'], default=str)[:120]}")
+            from agent_runner.shadow.diff import ShadowDiff
+
+            diff = ShadowDiff(shadow_interceptor.state)
+            print(f"\n{diff.summary()}")
 
             if cfg.share:
                 from agent_runner.sharing.run_store import RunStore
@@ -278,11 +397,20 @@ def main() -> None:
                 print(f"  http://localhost:{args.port}/review/{record.id}")
                 print(f"  (Start server with: python main.py --serve-approvals)")
             else:
-                answer = input("\nReplay captured writes? [y/N] ").strip().lower()
+                answer = input("\nReplay captured writes? [y/N/diff] ").strip().lower()
+                if answer == "diff":
+                    print(diff.full_diff())
+                    answer = input("Replay? [y/N] ").strip().lower()
                 if answer in ("y", "yes"):
-                    results = shadow_interceptor.replay(registry)
-                    for r in results:
-                        print(f"  Replayed {r['tool']}: {r['output']}")
+                    from agent_runner.shadow.replay import TransactionReplay
+
+                    replay_result = TransactionReplay(shadow_interceptor.state).execute()
+                    if replay_result.success:
+                        print(f"  Applied {len(replay_result.completed)} changes.")
+                    else:
+                        print(f"  FAILED: {replay_result.failed}")
+                        if replay_result.rolled_back:
+                            print("  All changes rolled back.")
 
     try:
         if args.prompt:
@@ -310,6 +438,15 @@ def main() -> None:
     finally:
         if mcp_client:
             mcp_client.stop()
+
+        # Print event summary
+        summary = event_stream.summary()
+        if summary.get("tool_calls", 0) > 0:
+            stats = event_stream.tool_stats()
+            print(f"\n--- Tool Stats ---")
+            for name, s in stats.items():
+                print(f"  {name}: {s['calls']} calls, {s['total_ms']:.0f}ms"
+                      + (f", {s['errors']} errors" if s['errors'] else ""))
 
 
 if __name__ == "__main__":
