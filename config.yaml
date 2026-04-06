@@ -1,0 +1,55 @@
+# Trading Bot Configuration
+# IMPORTANT: Default mode is PAPER TRADING. Set mode: "live" only after
+# thorough backtesting and with funds you can afford to lose.
+
+mode: "paper"  # "paper" or "live"
+
+# Polymarket CLOB API
+polymarket:
+  rest_url: "https://clob.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  chain_id: 137  # Polygon mainnet
+
+# Binance WebSocket (public, no auth needed for market data)
+binance:
+  ws_url: "wss://stream.binance.com:9443/ws"
+  symbol: "btcusdt"
+
+# Strategy: Liquidity Vacuum
+# Exploits empty order books when new 5-min markets spawn
+liquidity_vacuum:
+  enabled: true
+  max_entry_price: 0.03        # Only buy shares priced below this
+  max_position_size_usd: 50.0  # Max USD per trade
+  min_shares: 100              # Minimum shares to accumulate
+  exit_price: 0.40             # Sell when price reaches this level
+  hold_to_resolution: false    # If true, hold until market resolves
+
+# Strategy: Latency Arbitrage
+# Exploits price lag between Binance spot and Polymarket odds
+latency_arb:
+  enabled: true
+  min_edge_pct: 4.0            # Minimum edge after fees (%)
+  taker_fee_pct: 3.15          # Polymarket dynamic taker fee at $0.50
+  max_position_size_usd: 200.0
+  price_move_threshold_pct: 0.08  # Min BTC move to trigger signal
+  max_staleness_ms: 2000       # Max age of Polymarket quote to consider stale
+
+# Risk Management
+risk:
+  max_daily_loss_usd: 500.0
+  max_open_positions: 5
+  max_total_exposure_usd: 1000.0
+  cooldown_after_loss_sec: 30
+
+# Paper Trading
+paper:
+  starting_balance_usd: 10000.0
+  simulated_fill_slippage_pct: 0.5
+  simulated_latency_ms: 100
+
+# Logging
+logging:
+  level: "INFO"
+  file: "trading_bot.log"
+  trade_log: "trades.jsonl"
